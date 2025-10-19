@@ -1,0 +1,1264 @@
+# -*- coding: utf-8 -*-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.nn.init as init
+from torch.utils.data import Dataset, DataLoader
+from collections import defaultdict
+import numpy as np
+import random, os, re, math
+from tqdm import tqdm
+from sklearn.metrics import precision_score, recall_score, accuracy_score, roc_auc_score, average_precision_score, \
+    f1_score
+import pandas as pd
+import esm
+
+
+# ----------- ESM编码器 -----------
+class ESMEncoder:
+    def __init__(self, model_name="esm2_t6_8M_UR50D", device="cuda"):
+        self.device = device
+        print(f"加载ESM模型: {model_name}")
+        self.model, self.alphabet = esm.pretrained.load_model_and_alphabet(model_name)
+        self.model = self.model.to(device)
+        self.model.eval()
+        self.batch_converter = self.alphabet.get_batch_converter()
+        self.embed_dim = self.model.embed_dim
+        print(f"ESM模型加载完成，嵌入维度: {self.embed_dim}")
+
+    def encode_sequences(self, sequences: list, batch_size: int = 4,
+                         pooling_method: str = "cls") -> torch.Tensor:
+        """
+        编码蛋白质序列，使用CLS token作为序列表示
+        """
+        all_embeddings = []
+        print(f"开始编码 {len(sequences)} 个序列，池化方法: {pooling_method}")
+
+        with torch.no_grad():
+            for i in tqdm(range(0, len(sequences), batch_size), desc="ESM编码"):
+                batch_sequences = sequences[i:i + batch_size]
+                batch_data = [(f"protein_{i + j}", seq) for j, seq in enumerate(batch_sequences)]
+
+                try:
+                    batch_labels, batch_strs, batch_tokens = self.batch_converter(batch_data)
+                    batch_tokens = batch_tokens.to(self.device)
+
+                    results = self.model(batch_tokens, repr_layers=[self.model.num_layers], return_contacts=False)
+                    token_embeddings = results["representations"][self.model.num_layers]
+
+                    if pooling_method == "cls":
+                        # 使用CLS token (推荐)
+                        batch_embeddings = token_embeddings[:, 0, :]
+                    elif pooling_method == "mean":
+                        # 平均池化
+                        batch_embeddings = []
+                        for j, (_, seq) in enumerate(batch_data):
+                            seq_length = len(seq)
+                            valid_tokens = token_embeddings[j, 1:seq_length + 1]
+                            seq_embedding = valid_tokens.mean(dim=0)
+                            batch_embeddings.append(seq_embedding)
+                        batch_embeddings = torch.stack(batch_embeddings)
+
+                    all_embeddings.append(batch_embeddings.cpu())
+
+                except Exception as e:
+                    print(f"编码批次 {i} 时出错: {e}")
+                    batch_embeddings = torch.randn(len(batch_sequences), self.embed_dim)
+                    all_embeddings.append(batch_embeddings)
+
+        return torch.cat(all_embeddings, dim=0)
+
+
+# ----------- 数据预处理函数 -----------
+def transform_data(df):
+    """预处理数据，确保序列格式正确"""
+    # 确保序列列是字符串类型
+    sequence_columns = ['Peptide', 'TCR', 'HLA_sequence']
+    for col in sequence_columns:
+        if col in df.columns:
+            # 将列转换为字符串，并清理数据
+            df[col] = df[col].astype(str)
+            # 移除可能的NaN或空值
+            df[col] = df[col].replace(['nan', 'None', ''], 'A')  # 用'A'替换空值
+            # 确保序列不为空
+            df[col] = df[col].apply(lambda x: 'A' if len(x.strip()) == 0 else x.strip())
+
+    return df
+
+
+# ----------- 1. 数据加载 -----------
+def load_hla_pep(file):
+    """HLA,peptide,label(0/1)"""
+    if not os.path.exists(file):
+        print(f"[WARN] {file} 不存在");
+        return []
+
+    df = pd.read_csv(file)
+    df = transform_data(df)
+
+    data = []
+    for _, row in df.iterrows():
+        if 'HLA_sequence' in df.columns:
+            hla = row['HLA_sequence']
+        else:
+            hla = row['HLA']
+        pep = row['Peptide']
+        lab = row['label']
+        if lab in [0, 1, '0', '1']:
+            data.append((hla, pep, int(lab)))
+    return data
+
+
+def load_tcr_pep(file):
+    """TCR,peptide,label(0/1)"""
+    if not os.path.exists(file):
+        print(f"[WARN] {file} 不存在");
+        return []
+
+    df = pd.read_csv(file)
+    df = transform_data(df)
+
+    data = []
+    for _, row in df.iterrows():
+        tcr = row['TCR']
+        pep = row['Peptide']
+        lab = row['label']
+        if lab in [0, 1, '0', '1']:
+            data.append((tcr, pep, int(lab)))
+    return data
+
+
+def load_tcr_hla_pep(file):
+    """pep,hla,tcr,label(0/1) → 转 (TCR,HLA,pep,lab)"""
+    if not os.path.exists(file):
+        print(f"[WARN] {file} 不存在");
+        return []
+
+    df = pd.read_csv(file)
+    df = transform_data(df)
+
+    data = []
+    for _, row in df.iterrows():
+        pep = row['Peptide']
+        if 'HLA_sequence' in df.columns:
+            hla = row['HLA_sequence']
+        else:
+            hla = row['HLA']
+        tcr = row['TCR']
+        lab = row['label']
+        if lab in [0, 1, '0', '1']:
+            data.append((tcr, hla, pep, int(lab)))  # 统一成 (TCR, HLA, pep, lab)
+    return data
+
+
+# ----------- 2. 通用工具 -----------
+def build_global_peptide_mapping(hla_data, tcr_data, tcr_hla_data=None):
+    pep_set = set()
+    for _, pep, _ in hla_data + tcr_data:
+        pep_set.add(pep)
+    if tcr_hla_data:
+        for _, _, pep, _ in tcr_hla_data:
+            pep_set.add(pep)
+    pep2id = {p: i for i, p in enumerate(sorted(pep_set))}
+    id2pep = {i: p for p, i in pep2id.items()}
+    return pep2id, id2pep, len(pep2id)
+
+
+def build_global_tcr_mapping(tcr_data, tcr_hla_data=None):
+    """构建TCR的全局映射"""
+    tcr_set = set()
+    for tcr, _, _ in tcr_data:
+        tcr_set.add(tcr)
+    if tcr_hla_data:
+        for tcr, _, _, _ in tcr_hla_data:
+            tcr_set.add(tcr)
+    tcr2id = {t: i for i, t in enumerate(sorted(tcr_set))}
+    id2tcr = {i: t for t, i in tcr2id.items()}
+    return tcr2id, id2tcr, len(tcr2id)
+
+
+def build_global_hla_mapping(hla_data, tcr_hla_data=None):
+    """构建HLA的全局映射"""
+    hla_set = set()
+    for hla, _, _ in hla_data:
+        hla_set.add(hla)
+    if tcr_hla_data:
+        for _, hla, _, _ in tcr_hla_data:
+            hla_set.add(hla)
+    hla2id = {h: i for i, h in enumerate(sorted(hla_set))}
+    id2hla = {i: h for h, i in hla2id.items()}
+    return hla2id, id2hla, len(hla2id)
+
+
+def create_entity_mapping(data):
+    ents = set()
+    for triple in data:
+        if len(triple) == 3:  # (h, t, lab) 格式
+            h, t, _ = triple
+            ents.add(h)
+            ents.add(t)
+    ent2id = {e: i for i, e in enumerate(sorted(ents))}
+    id2ent = {i: e for e, i in ent2id.items()}
+    return ent2id, id2ent, len(ent2id)
+
+
+def create_kg_triples(data, ent2id):
+    triples = []
+    for h, t, lab in data:
+        if h in ent2id and t in ent2id:
+            triples.append((ent2id[h], lab, ent2id[t]))
+    return triples
+
+
+def build_adjacency_list(triples, n_ent, n_rel):
+    kg = defaultdict(list)
+    for h, r, t in triples:
+        kg[h].append((t, r))
+    for e in range(n_ent):
+        if not kg[e]:
+            kg[e] = [(e, 0)]
+    return kg
+
+
+def construct_adj(neighbor_sample_size, kg, n_ent, device='cpu'):
+    # 预分配数组
+    adj_ent = np.zeros([n_ent, neighbor_sample_size], dtype=np.int64)
+    adj_rel = np.zeros([n_ent, neighbor_sample_size], dtype=np.int64)
+
+    for e in range(n_ent):
+        neighbors = kg[e]
+        n_nei = len(neighbors)
+        if n_nei >= neighbor_sample_size:
+            samp = np.random.choice(n_nei, neighbor_sample_size, replace=False)
+        else:
+            samp = np.random.choice(n_nei, neighbor_sample_size, replace=True)
+        adj_ent[e] = [neighbors[i][0] for i in samp]
+        adj_rel[e] = [neighbors[i][1] for i in samp]
+
+    # 一次性转换为tensor，避免警告
+    adj_ent_tensor = torch.LongTensor(adj_ent).to(device)
+    adj_rel_tensor = torch.LongTensor(adj_rel).to(device)
+
+    return adj_ent_tensor, adj_rel_tensor
+
+
+# ----------- 3. KGAN with ESM -----------
+class KGAN(nn.Module):
+    def __init__(self, n_ent, n_rel, e_dim, r_dim, adj_ent, adj_rel,
+                 agg_method='Bi-Interaction', device='cuda', esm_encoder=None):
+        super().__init__()
+        self.device = device
+        self.n_ent = n_ent
+        self.ent_embs = nn.Embedding(n_ent, e_dim, max_norm=1)
+        self.rel_embs = nn.Embedding(n_rel, r_dim, max_norm=1)
+        # 直接存储tensor，避免重复转换
+        self.register_buffer('adj_ent', adj_ent)
+        self.register_buffer('adj_rel', adj_rel)
+        self.agg_method = agg_method
+        self.Wr = nn.Linear(e_dim, r_dim)
+        self.leaky = nn.LeakyReLU(0.2)
+
+        # ESM编码器
+        self.esm_encoder = esm_encoder
+        self.use_esm = esm_encoder is not None
+
+        # ESM特征融合层
+        if self.use_esm:
+            self.esm_dim = esm_encoder.embed_dim
+            self.esm_fusion = nn.Linear(self.esm_dim + e_dim, e_dim)
+
+        if agg_method == 'concat':
+            self.Wcat = nn.Linear(e_dim * 2, e_dim)
+        else:
+            self.W1 = nn.Linear(e_dim, e_dim)
+            if agg_method == 'Bi-Interaction':
+                self.W2 = nn.Linear(e_dim, e_dim)
+        self.combine_layer = nn.Sequential(
+            nn.Linear(e_dim * 2, e_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.LayerNorm(e_dim)
+        )
+        self.rel_classifier = nn.Sequential(
+            nn.Linear(e_dim * 2, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        self.triple_classifier = nn.Sequential(
+            nn.Linear(e_dim * 3, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                init.xavier_uniform_(m.weight)
+                if m.bias is not None: init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Embedding):
+                init.xavier_uniform_(m.weight)
+
+    def fuse_esm_features(self, kg_embeddings, esm_embeddings):
+        """融合KG嵌入和ESM嵌入"""
+        if self.use_esm and esm_embeddings is not None:
+            # 确保ESM嵌入在正确的设备上且维度匹配
+            esm_embeddings = esm_embeddings.to(kg_embeddings.device)
+            # 如果esm_embeddings是2D但kg_embeddings是3D，需要调整维度
+            if kg_embeddings.dim() == 3 and esm_embeddings.dim() == 2:
+                esm_embeddings = esm_embeddings.unsqueeze(1).expand(-1, kg_embeddings.size(1), -1)
+            # 拼接KG和ESM特征
+            combined = torch.cat([kg_embeddings, esm_embeddings], dim=-1)
+            # 通过融合层
+            fused = self.esm_fusion(combined)
+            return fused
+        else:
+            return kg_embeddings
+
+    def encode_hla_peptide_pair(self, hla_idx, pep_idx, hla_esm=None, pep_esm=None):
+        h = self.forward(hla_idx, hla_esm)
+        p = self.forward(pep_idx, pep_esm)
+        # 确保h和p的维度相同
+        if h.dim() == 1:
+            h = h.unsqueeze(0)
+        if p.dim() == 1:
+            p = p.unsqueeze(0)
+        return self.combine_layer(torch.cat([h, p], dim=-1))
+
+    def get_neighbors(self, items):
+        # 直接使用索引操作，避免列表操作
+        if isinstance(items, torch.Tensor):
+            items = items.cpu()
+
+        # 确保索引在有效范围内
+        items = torch.clamp(items, 0, self.n_ent - 1)
+
+        # 直接使用高级索引，避免循环
+        e_ids = self.adj_ent[items]
+        r_ids = self.adj_rel[items]
+
+        return self.ent_embs(e_ids), self.rel_embs(r_ids)
+
+    def GATMessagePass(self, h_embs, r_embs, t_embs):
+        h_broadcast = h_embs.unsqueeze(1).expand(-1, t_embs.size(1), -1)
+        tr = self.Wr(t_embs)
+        hr = self.Wr(h_broadcast)
+        att = torch.softmax(torch.sum(torch.tanh(hr + r_embs) * tr, dim=-1, keepdim=True), dim=1)
+        return (t_embs * att).sum(dim=1)
+
+    def aggregate(self, h_embs, Nh_embs):
+        if self.agg_method == 'Bi-Interaction':
+            return self.leaky(self.W1(h_embs + Nh_embs)) + self.leaky(self.W2(h_embs * Nh_embs))
+        elif self.agg_method == 'concat':
+            return self.leaky(self.Wcat(torch.cat([h_embs, Nh_embs], dim=-1)))
+        else:
+            return self.leaky(self.W1(h_embs + Nh_embs))
+
+    def forward(self, idx, esm_emb=None):
+        idx = idx.to(self.device)
+        # 确保索引在有效范围内
+        idx = torch.clamp(idx, 0, self.n_ent - 1)
+        t_embs, r_embs = self.get_neighbors(idx)
+        h_embs = self.ent_embs(idx)
+
+        # 融合ESM特征
+        h_embs = self.fuse_esm_features(h_embs, esm_emb)
+
+        Nh = self.GATMessagePass(h_embs, r_embs, t_embs)
+        return self.aggregate(h_embs, Nh)
+
+    def forward_relation(self, h_idx, t_idx, h_esm=None, t_esm=None):
+        h_e = self.forward(h_idx, h_esm)
+        t_e = self.forward(t_idx, t_esm)
+        concat = torch.cat([h_e, t_e], dim=-1)
+        logits = self.rel_classifier(concat).squeeze(-1)
+        return logits, h_e, t_e
+
+    # def forward_triple(self, tcr_idx, hla_idx, pep_idx, tcr_esm=None, hla_esm=None, pep_esm=None):
+    #     """三元组分类：TCR-HLA-肽"""
+    #     tcr_e = self.forward(tcr_idx, tcr_esm)
+    #     hla_e = self.forward(hla_idx, hla_esm)
+    #     pep_e = self.forward(pep_idx, pep_esm)
+
+    #     # 拼接三个实体的嵌入
+    #     triple_emb = torch.cat([tcr_e, hla_e, pep_e], dim=-1)
+    #     logits = self.triple_classifier(triple_emb).squeeze(-1)
+    #     return logits
+
+
+# ----------- 4. Transformer Decoder -----------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        self.d_model = d_model
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).float().unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0))  # [1, max_len, d_model]
+
+    def forward(self, x):
+        # x: [batch_size, seq_len, d_model]
+        seq_len = x.size(1)
+        return x + self.pe[:, :seq_len, :]
+class CausalMutiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model:int, nhead:int,dropout=0.1):
+        super().__init__()
+        assert d_model % nhead == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.nhead = nhead
+        self.dropout =dropout
+        self.head_dim = d_model//nhead
+        self.scale = math.sqrt(self.head_dim)
+
+        self.q_proj = nn.Linear(d_model,d_model)
+        self.k_proj = nn.Linear(d_model,d_model)
+        self.v_proj = nn.Linear(d_model,d_model)
+        self.out_proj = nn.Linear(d_model,d_model)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+    def forward(self,x,attn_mask =None ):
+        B,T,C = x.shape
+        q = self.q_proj(x).view(B,T,self.nhead,self.head_dim).transpose(1,2)
+        k = self.k_proj(x).view(B,T,self.nhead,self.head_dim).transpose(1,2)
+        v = self.v_proj(x).view(B,T,self.nhead,self.head_dim).transpose(1,2)
+        attn_scores = torch.matmul(q,k.transpose(-2,-1))/self.scale
+        causal_mask = torch.triu(torch.ones(T,T,device="cuda"),diagonal=1).bool()
+        attn_scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0),float('-inf'))
+        attn_weight = torch.softmax(attn_scores,dim=-1)
+        attn_out = torch.matmul(attn_weight,v)
+        attn_out = attn_out.transpose(1,2).contiguous().view(B,T,C)
+        return self.out_proj(self.dropout(attn_out)),attn_weight
+class MUtiHeadCrossAttetion(nn.Module):
+    def __init__(self, d_model, nhead, dropout=0.1):
+        super().__init__()
+        assert d_model%nhead == 0
+        self.nhead = nhead
+        self.head_dim = d_model//nhead
+        self.scale = math.sqrt(self.head_dim)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, q_input, memory):
+        B, T, _ = q_input.size()
+        M = memory.size(1)
+        q = self.q_proj(q_input).view(B, T, self.nhead, self.head_dim).transpose(1, 2)
+        k = self.k_proj(memory).view(B, M, self.nhead, self.head_dim).transpose(1, 2)
+        v = self.v_proj(memory).view(B, M, self.nhead, self.head_dim).transpose(1, 2)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        attn = torch.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, T, -1)
+        return self.out_proj(self.dropout(out)), attn
+class DecoderLayerNew(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=512, dropout=0.1):
+        super().__init__()
+        self.self_attn = CausalMutiHeadSelfAttention(d_model, nhead, dropout)
+        self.cross_attn = MUtiHeadCrossAttetion(d_model, nhead, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model) 
+        self.norm3 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x, memory):
+        sa_out, _ = self.self_attn(x)
+        x = self.norm1(x + sa_out)
+        ca_out, _ = self.cross_attn(x, memory)
+        x = self.norm2(x + ca_out)
+        x = self.norm3(x + self.ffn(x))
+        return x   
+class TransformerDecoderNew(nn.Module):
+    def __init__(self, input_dim, d_model, nhead, num_layers, vocab_size,
+                 cls_num_classes=3, dropout=0.1, max_len=128):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, d_model)
+        self.pos = PositionalEncoding(d_model)
+        self.mem_proj = nn.Linear(input_dim, d_model)
+        self.layers = nn.ModuleList([
+            DecoderLayerNew(d_model, nhead, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+        self.generator = nn.Linear(d_model, vocab_size)
+        # 分类头
+        self.pep_hla_head = nn.Linear(d_model, cls_num_classes)
+        self.pep_tcr_head = nn.Linear(d_model, cls_num_classes)
+        self.hla_pep_tcr_head = nn.Linear(d_model, cls_num_classes)
+
+    def forward(self, mem, ent_mem=None, tgt=None, max_len=50):
+        B = mem.size(0)
+        mem_proj = self.mem_proj(mem).unsqueeze(1)
+        if ent_mem is None:
+            ent_mem = mem_proj
+        else:
+            ent_mem = self.mem_proj(ent_mem).unsqueeze(0).expand(B, -1, -1)
+
+        if tgt is not None:
+            tgt_emb = self.pos(self.emb(tgt))
+        else:
+            tgt_emb = self.pos(self.emb(torch.zeros(B, max_len, dtype=torch.long, device=mem.device)))
+
+        x = tgt_emb
+        for layer in self.layers:
+            x = layer(x, ent_mem)
+        gen_logits = self.generator(x)
+
+        # 分类输出：softmax 概率
+        cls_vec = mem_proj.squeeze(1)
+        probs = {
+            "pep_hla_probs": F.softmax(self.pep_hla_head(cls_vec), dim=1),
+            "pep_tcr_probs": F.softmax(self.pep_tcr_head(cls_vec), dim=1),
+            "hla_pep_tcr_probs": F.softmax(self.hla_pep_tcr_head(cls_vec), dim=1),
+        }
+        return gen_logits, probs     
+class TransformerDecoder(nn.Module):
+    def __init__(self, input_dim, d_model, nhead, num_layers, vocab_size,
+                 dropout=0.1, max_len=100):
+        super().__init__()
+        self.d_model, self.vocab_size, self.max_len = d_model, vocab_size, max_len
+        self.emb = nn.Embedding(vocab_size, d_model)
+        self.pos = PositionalEncoding(d_model, max_len)
+        self.proj = nn.Linear(input_dim, d_model)
+        layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=nhead,
+                                           dropout=dropout, batch_first=True)
+        self.decoder = nn.TransformerDecoder(layer, num_layers)
+        self.out = nn.Linear(d_model, vocab_size)
+        self.drop = nn.Dropout(dropout)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                init.xavier_uniform_(m.weight)
+                if m.bias is not None: init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Embedding):
+                init.xavier_uniform_(m.weight)
+
+    def generate_mask(self, sz):
+        mask = torch.triu(torch.ones(sz, sz, dtype=torch.bool), diagonal=1)
+        return mask
+
+    def forward(self, mem, tgt=None, max_len=None, teacher_ratio=0.5):
+        B = mem.size(0)
+        max_len = max_len or self.max_len
+
+        # 投影记忆向量
+        mem_proj = self.proj(mem).unsqueeze(1)  # [B, 1, d_model]
+
+        if tgt is not None and random.random() < teacher_ratio:
+            # 教师强制训练 - 输入不包括最后一个token
+            tgt_input = tgt[:, :-1]
+            tgt_emb = self.emb(tgt_input) * math.sqrt(self.d_model)
+            tgt_emb = self.pos(self.drop(tgt_emb))
+
+            tgt_mask = self.generate_mask(tgt_input.size(1)).to(mem.device)
+
+            out = self.decoder(
+                tgt=tgt_emb,
+                memory=mem_proj,
+                tgt_mask=tgt_mask
+            )
+            return self.out(out)
+        else:
+            # 推理模式
+            tokens = torch.full((B, 1), 0, dtype=torch.long, device=mem.device)  # 从<sos>开始
+            logits = []
+
+            for i in range(max_len):
+                tgt_emb = self.emb(tokens) * math.sqrt(self.d_model)
+                tgt_emb = self.pos(self.drop(tgt_emb))
+
+                tgt_mask = self.generate_mask(tokens.size(1)).to(mem.device)
+
+                out = self.decoder(
+                    tgt=tgt_emb,
+                    memory=mem_proj,
+                    tgt_mask=tgt_mask
+                )
+
+                next_logit = self.out(out[:, -1, :])  # 只取最后一个时间步
+                logits.append(next_logit.unsqueeze(1))
+
+                next_token = next_logit.argmax(-1).unsqueeze(1)
+                tokens = torch.cat([tokens, next_token], dim=1)
+
+                # 如果所有序列都生成了<eos>，提前停止
+                if (next_token == 1).all():  # <eos>=1
+                    break
+
+            return torch.cat(logits, dim=1)  # [B, generated_len, vocab_size]
+
+
+# ----------- 5. TCR Dataset with ESM -----------
+class TCRGenerationDataset(Dataset):
+    def __init__(self, tcr_data, hla_ent2id, pep2id, esm_encoder=None, max_len=30, use_esm=True):
+        self.max_len = max_len
+        self.pep2id, self.id2pep = pep2id, {v: k for k, v in pep2id.items()}
+        self.esm_encoder = esm_encoder
+        self.use_esm = use_esm
+
+        # 收集所有有效的氨基酸字符
+        aas = set()
+        for tcr, hla, pep, lab in tcr_data:
+            clean_tcr = re.sub(r'[^ACDEFGHIKLMNPQRSTVWY]', '', tcr.upper())
+            aas.update(clean_tcr)
+
+        self.aas = sorted(aas)
+        self.vocab_size = len(self.aas) + 3
+        self.aa2i = {aa: i + 3 for i, aa in enumerate(self.aas)}
+        self.i2aa = {i + 3: aa for i, aa in enumerate(self.aas)}
+
+        # 特殊token
+        self.sos, self.eos, self.pad = 0, 1, 2
+        self.aa2i['<sos>'] = self.sos
+        self.aa2i['<eos>'] = self.eos
+        self.aa2i['<pad>'] = self.pad
+
+        # 构建样本
+        self.samples = []
+        self.esm_embeddings = {}
+
+        # 预计算ESM嵌入
+        if self.use_esm and self.esm_encoder is not None:
+            self._precompute_esm_embeddings(tcr_data)
+
+        for tcr, hla, pep, lab in tcr_data:
+            if hla in hla_ent2id and pep in self.pep2id:
+                clean_tcr = re.sub(r'[^ACDEFGHIKLMNPQRSTVWY]', '', tcr.upper())
+                if clean_tcr and len(clean_tcr) > 3:
+                    encoded_tcr = self.encode_tcr(clean_tcr)
+
+                    # 获取ESM嵌入 - 修复：处理可能不存在的键
+                    hla_esm = self.esm_embeddings.get(hla,
+                                                      torch.zeros(self.esm_encoder.embed_dim)) if self.use_esm else None
+                    pep_esm = self.esm_embeddings.get(pep,
+                                                      torch.zeros(self.esm_encoder.embed_dim)) if self.use_esm else None
+
+                    self.samples.append((hla_ent2id[hla], self.pep2id[pep], encoded_tcr, hla_esm, pep_esm))
+
+        print(f'[Dataset] 最终样本数: {len(self.samples)}')
+
+    def _precompute_esm_embeddings(self, tcr_data):
+        """预计算所有序列的ESM嵌入"""
+        print("预计算ESM序列嵌入...")
+
+        # 收集所有唯一的序列
+        all_sequences = set()
+        for tcr, hla, pep, lab in tcr_data:
+            all_sequences.add(hla)
+            all_sequences.add(pep)
+
+        sequences_list = list(all_sequences)
+        print(f"发现 {len(sequences_list)} 个唯一序列")
+
+        # 编码序列
+        if sequences_list:
+            try:
+                sequence_embeddings = self.esm_encoder.encode_sequences(sequences_list)
+
+                # 创建序列到嵌入的映射
+                for seq, emb in zip(sequences_list, sequence_embeddings):
+                    self.esm_embeddings[seq] = emb
+                print(f"预计算了 {len(self.esm_embeddings)} 个序列的嵌入")
+            except Exception as e:
+                print(f"ESM编码出错: {e}")
+                # 如果ESM编码失败，创建零向量
+                for seq in sequences_list:
+                    self.esm_embeddings[seq] = torch.zeros(self.esm_encoder.embed_dim)
+
+    def __getitem__(self, idx):
+        h, p, t, h_esm, p_esm = self.samples[idx]
+        if self.use_esm:
+            return torch.LongTensor([h]), torch.LongTensor([p]), torch.LongTensor(t), h_esm.clone(), p_esm.clone()
+        else:
+            return torch.LongTensor([h]), torch.LongTensor([p]), torch.LongTensor(t)
+
+
+class TCRGenerator(nn.Module):
+    def __init__(self, encoder, decoder):
+        super().__init__()
+        self.enc = encoder
+        self.dec = decoder
+
+    def forward(self, hla, pep, tgt=None, max_len=20, teacher_ratio=0.5, hla_esm=None, pep_esm=None):
+        mem = self.enc.encode_hla_peptide_pair(hla, pep, hla_esm, pep_esm)
+        return self.dec(mem, tgt, max_len, teacher_ratio)
+
+
+# ----------- 6. 训练逻辑 -----------
+def calculate_metrics(y_true, y_pred, y_score):
+    """计算所有评估指标"""
+    metrics = {}
+
+    # 二分类指标
+    metrics['accuracy'] = accuracy_score(y_true, y_pred)
+    metrics['precision'] = precision_score(y_true, y_pred, zero_division=0)
+    metrics['recall'] = recall_score(y_true, y_pred, zero_division=0)
+    metrics['f1'] = f1_score(y_true, y_pred, zero_division=0)
+
+    # 概率指标
+    if len(np.unique(y_true)) > 1:  # 确保有正负样本
+        try:
+            metrics['auc_roc'] = roc_auc_score(y_true, y_score)
+            metrics['auc_pr'] = average_precision_score(y_true, y_score)
+        except:
+            metrics['auc_roc'] = 0.5
+            metrics['auc_pr'] = 0.5
+    else:
+        metrics['auc_roc'] = 0.5
+        metrics['auc_pr'] = 0.5
+
+    return metrics
+
+
+def print_metrics(metrics, prefix=""):
+    """打印评估指标"""
+    print(f"{prefix}评估指标:")
+    print(f"  Accuracy:  {metrics['accuracy']:.4f}")
+    print(f"  Precision: {metrics['precision']:.4f}")
+    print(f"  Recall:    {metrics['recall']:.4f}")
+    print(f"  F1-Score:  {metrics['f1']:.4f}")
+    print(f"  AUC-ROC:   {metrics['auc_roc']:.4f}")
+    print(f"  AUC-PR:    {metrics['auc_pr']:.4f}")
+
+
+def pretrain_kgan_with_relation(data, n_epochs=10, batch_size=32,
+                                device='cpu', lambda_rel=1.0,
+                                pep2id=None, relation_type="hla_pep", esm_encoder=None):
+    print(f"=== 预训练 KGAN（{relation_type} 关系学习） ===")
+
+    # 创建实体映射
+    ent2id, id2ent, n_ents = create_entity_mapping(data)
+
+    # 添加肽到实体映射
+    if pep2id:
+        for p in pep2id:
+            if p not in ent2id:
+                ent2id[p] = len(ent2id)
+
+    n_ent = len(ent2id)
+
+    # 直接使用数据中的所有三元组（包含正负样本）
+    triples = create_kg_triples(data, ent2id)
+    random.shuffle(triples)
+
+    # 统计正负样本
+    pos_count = sum(1 for _, r, _ in triples if r == 1)
+    neg_count = sum(1 for _, r, _ in triples if r == 0)
+    print(f"正样本: {pos_count}, 负样本: {neg_count}, 总计: {len(triples)}")
+
+    n_rel = 2
+    kg_idx = build_adjacency_list(triples, n_ent, n_rel)
+    adj_ent, adj_rel = construct_adj(20, kg_idx, n_ent, device)
+
+    e_dim, r_dim = 64, 32
+    model = KGAN(n_ent, n_rel, e_dim, r_dim, adj_ent, adj_rel, device=device, esm_encoder=esm_encoder).to(device)
+    opt = optim.Adam(model.parameters(), lr=1e-3)
+    bce = nn.BCEWithLogitsLoss()
+
+    # 预计算ESM嵌入 - 修复：添加错误处理
+    esm_embeddings = {}
+    if esm_encoder is not None:
+        print("预计算ESM嵌入用于关系预训练...")
+        all_sequences = set()
+        for h, t, _ in data:
+            all_sequences.add(h)
+            all_sequences.add(t)
+
+        sequences_list = list(all_sequences)
+        if sequences_list:
+            try:
+                sequence_embeddings = esm_encoder.encode_sequences(sequences_list)
+                for seq, emb in zip(sequences_list, sequence_embeddings):
+                    esm_embeddings[seq] = emb
+                print(f"预计算了 {len(esm_embeddings)} 个ESM嵌入")
+            except Exception as e:
+                print(f"ESM预计算失败: {e}")
+                # 创建零向量作为后备
+                for seq in sequences_list:
+                    esm_embeddings[seq] = torch.zeros(esm_encoder.embed_dim)
+
+    # 训练循环 - 修复：处理ESM嵌入可能为None的情况
+    for epoch in range(n_epochs):
+        model.train()
+        random.shuffle(triples)
+        total_loss, total_acc, n = 0, 0, 0
+
+        for i in range(0, len(triples), batch_size):
+            batch = triples[i:i + batch_size]
+            h = torch.tensor([b[0] for b in batch], dtype=torch.long).to(device)
+            r = torch.tensor([b[1] for b in batch], dtype=torch.float).to(device)
+            t = torch.tensor([b[2] for b in batch], dtype=torch.long).to(device)
+
+            # 获取ESM嵌入 - 修复：处理不存在的键
+            h_esm = None
+            t_esm = None
+            if esm_encoder is not None:
+                h_esm_list = []
+                t_esm_list = []
+                for b in batch:
+                    h_ent = id2ent[b[0]]
+                    t_ent = id2ent[b[2]]
+                    h_esm_list.append(esm_embeddings.get(h_ent, torch.zeros(esm_encoder.embed_dim)))
+                    t_esm_list.append(esm_embeddings.get(t_ent, torch.zeros(esm_encoder.embed_dim)))
+
+                if h_esm_list:
+                    h_esm = torch.stack(h_esm_list).to(device)
+                if t_esm_list:
+                    t_esm = torch.stack(t_esm_list).to(device)
+
+            logits, h_e, t_e = model.forward_relation(h, t, h_esm, t_esm)
+            loss_rel = bce(logits, r)
+            loss_rec = (h_e.norm(2, dim=1).mean() + t_e.norm(2, dim=1).mean())
+            loss = loss_rel + lambda_rel * loss_rec
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total_loss += loss.item() * len(batch)
+            pred = (torch.sigmoid(logits) > 0.5).float()
+            total_acc += (pred == r).sum().item()
+            n += len(batch)
+
+        print(
+            f'{relation_type.upper()} PreTrain Epoch {epoch + 1}/{n_epochs}  loss={total_loss / n:.4f}  acc={total_acc / n:.4f}')
+
+    return model, ent2id, id2ent, n_ent
+
+
+# ----------- 三元组分类训练 -----------
+def train_triple_classifier(model, triple_data, tcr2id, hla2id, pep2id,
+                            n_epochs=10, batch_size=32, device='cpu', esm_encoder=None):
+    """训练三元组分类器 (TCR-HLA-肽)"""
+    print("=== 训练三元组分类器 (TCR-HLA-肽) ===")
+
+    # 准备训练数据
+    train_triples = []
+    for tcr, hla, pep, lab in triple_data:
+        if tcr in tcr2id and hla in hla2id and pep in pep2id:
+            train_triples.append((tcr2id[tcr], hla2id[hla], pep2id[pep], lab))
+
+    # 统计正负样本
+    pos_count = sum(1 for _, _, _, lab in train_triples if lab == 1)
+    neg_count = sum(1 for _, _, _, lab in train_triples if lab == 0)
+    print(f"正样本: {pos_count}, 负样本: {neg_count}, 总计: {len(train_triples)}")
+
+    random.shuffle(train_triples)
+
+    # 预计算ESM嵌入
+    esm_embeddings = {}
+    if esm_encoder is not None:
+        print("预计算三元组数据的ESM嵌入...")
+        all_sequences = set()
+        for tcr, hla, pep, _ in triple_data:
+            all_sequences.add(tcr)
+            all_sequences.add(hla)
+            all_sequences.add(pep)
+
+        sequences_list = list(all_sequences)
+        if sequences_list:
+            try:
+                sequence_embeddings = esm_encoder.encode_sequences(sequences_list)
+                for seq, emb in zip(sequences_list, sequence_embeddings):
+                    esm_embeddings[seq] = emb
+                print(f"预计算了 {len(esm_embeddings)} 个序列的ESM嵌入")
+            except Exception as e:
+                print(f"三元组ESM预计算失败: {e}")
+                for seq in sequences_list:
+                    esm_embeddings[seq] = torch.zeros(esm_encoder.embed_dim)
+
+    opt = optim.Adam(model.parameters(), lr=1e-4)
+    bce = nn.BCEWithLogitsLoss()
+
+    # 用于评估的列表
+    all_preds = []
+    all_labels = []
+    all_scores = []
+
+    for epoch in range(n_epochs):
+        model.train()
+        random.shuffle(train_triples)
+        total_loss, total_acc, n = 0, 0, 0
+
+        epoch_preds = []
+        epoch_labels = []
+        epoch_scores = []
+
+        for i in range(0, len(train_triples), batch_size):
+            batch = train_triples[i:i + batch_size]
+
+            tcr_idx = torch.tensor([b[0] for b in batch], dtype=torch.long).to(device)
+            hla_idx = torch.tensor([b[1] for b in batch], dtype=torch.long).to(device)
+            pep_idx = torch.tensor([b[2] for b in batch], dtype=torch.long).to(device)
+            labels = torch.tensor([b[3] for b in batch], dtype=torch.float).to(device)
+
+            # 获取ESM嵌入
+            tcr_esm, hla_esm, pep_esm = None, None, None
+            if esm_encoder is not None:
+                tcr_esm_list = []
+                hla_esm_list = []
+                pep_esm_list = []
+
+                for b in batch:
+                    tcr_seq = list(tcr2id.keys())[list(tcr2id.values()).index(b[0])]
+                    hla_seq = list(hla2id.keys())[list(hla2id.values()).index(b[1])]
+                    pep_seq = list(pep2id.keys())[list(pep2id.values()).index(b[2])]
+
+                    tcr_esm_list.append(esm_embeddings.get(tcr_seq, torch.zeros(esm_encoder.embed_dim)))
+                    hla_esm_list.append(esm_embeddings.get(hla_seq, torch.zeros(esm_encoder.embed_dim)))
+                    pep_esm_list.append(esm_embeddings.get(pep_seq, torch.zeros(esm_encoder.embed_dim)))
+
+                if tcr_esm_list:
+                    tcr_esm = torch.stack(tcr_esm_list).to(device)
+                if hla_esm_list:
+                    hla_esm = torch.stack(hla_esm_list).to(device)
+                if pep_esm_list:
+                    pep_esm = torch.stack(pep_esm_list).to(device)
+
+            logits = model.forward_triple(tcr_idx, hla_idx, pep_idx, tcr_esm, hla_esm, pep_esm)
+            loss = bce(logits, labels)
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total_loss += loss.item() * len(batch)
+            pred = (torch.sigmoid(logits) > 0.5).float()
+            total_acc += (pred == labels).sum().item()
+            n += len(batch)
+
+            # 收集评估数据
+            epoch_preds.extend(pred.cpu().numpy())
+            epoch_labels.extend(labels.cpu().numpy())
+            epoch_scores.extend(torch.sigmoid(logits).cpu().detach().numpy())
+
+        # 计算epoch指标
+        epoch_metrics = calculate_metrics(epoch_labels, epoch_preds, epoch_scores)
+
+        print(f'Triple Classifier Epoch {epoch + 1}/{n_epochs}  loss={total_loss / n:.4f}  acc={total_acc / n:.4f}')
+        print_metrics(epoch_metrics, "  Triple ")
+
+        # 收集所有epoch的数据
+        all_preds.extend(epoch_preds)
+        all_labels.extend(epoch_labels)
+        all_scores.extend(epoch_scores)
+
+    # 计算总体指标
+    final_metrics = calculate_metrics(all_labels, all_preds, all_scores)
+    print(f"\n三元组分类器最终指标:")
+    print_metrics(final_metrics)
+
+    return model
+
+
+# ----------- 评估三元组分类器 -----------
+def evaluate_triple_classifier(model, triple_data, tcr2id, hla2id, pep2id,
+                               batch_size=32, device='cpu', esm_encoder=None):
+    """评估三元组分类器"""
+    print("=== 评估三元组分类器 ===")
+
+    model.eval()
+
+    # 准备测试数据
+    test_triples = []
+    for tcr, hla, pep, lab in triple_data:
+        if tcr in tcr2id and hla in hla2id and pep in pep2id:
+            test_triples.append((tcr2id[tcr], hla2id[hla], pep2id[pep], lab))
+
+    # 预计算ESM嵌入
+    esm_embeddings = {}
+    if esm_encoder is not None:
+        print("预计算测试数据的ESM嵌入...")
+        all_sequences = set()
+        for tcr, hla, pep, _ in triple_data:
+            all_sequences.add(tcr)
+            all_sequences.add(hla)
+            all_sequences.add(pep)
+
+        sequences_list = list(all_sequences)
+        if sequences_list:
+            try:
+                sequence_embeddings = esm_encoder.encode_sequences(sequences_list)
+                for seq, emb in zip(sequences_list, sequence_embeddings):
+                    esm_embeddings[seq] = emb
+            except Exception as e:
+                print(f"测试数据ESM预计算失败: {e}")
+                for seq in sequences_list:
+                    esm_embeddings[seq] = torch.zeros(esm_encoder.embed_dim)
+
+    all_preds = []
+    all_labels = []
+    all_scores = []
+
+    with torch.no_grad():
+        for i in range(0, len(test_triples), batch_size):
+            batch = test_triples[i:i + batch_size]
+
+            tcr_idx = torch.tensor([b[0] for b in batch], dtype=torch.long).to(device)
+            hla_idx = torch.tensor([b[1] for b in batch], dtype=torch.long).to(device)
+            pep_idx = torch.tensor([b[2] for b in batch], dtype=torch.long).to(device)
+            labels = torch.tensor([b[3] for b in batch], dtype=torch.float).to(device)
+
+            # 获取ESM嵌入
+            tcr_esm, hla_esm, pep_esm = None, None, None
+            if esm_encoder is not None:
+                tcr_esm_list = []
+                hla_esm_list = []
+                pep_esm_list = []
+
+                for b in batch:
+                    tcr_seq = list(tcr2id.keys())[list(tcr2id.values()).index(b[0])]
+                    hla_seq = list(hla2id.keys())[list(hla2id.values()).index(b[1])]
+                    pep_seq = list(pep2id.keys())[list(pep2id.values()).index(b[2])]
+
+                    tcr_esm_list.append(esm_embeddings.get(tcr_seq, torch.zeros(esm_encoder.embed_dim)))
+                    hla_esm_list.append(esm_embeddings.get(hla_seq, torch.zeros(esm_encoder.embed_dim)))
+                    pep_esm_list.append(esm_embeddings.get(pep_seq, torch.zeros(esm_encoder.embed_dim)))
+
+                if tcr_esm_list:
+                    tcr_esm = torch.stack(tcr_esm_list).to(device)
+                if hla_esm_list:
+                    hla_esm = torch.stack(hla_esm_list).to(device)
+                if pep_esm_list:
+                    pep_esm = torch.stack(pep_esm_list).to(device)
+
+            logits = model.forward_triple(tcr_idx, hla_idx, pep_idx, tcr_esm, hla_esm, pep_esm)
+
+            pred = (torch.sigmoid(logits) > 0.5).float()
+
+            all_preds.extend(pred.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_scores.extend(torch.sigmoid(logits).cpu().numpy())
+
+    # 计算评估指标
+    test_metrics = calculate_metrics(all_labels, all_preds, all_scores)
+    print("三元组分类器测试结果:")
+    print_metrics(test_metrics)
+
+    return test_metrics
+
+
+def train_tcr_generator(model, dataset, n_epochs=20, batch_size=32, device='cpu'):
+    print("=== 训练 TCR 生成器 ===")
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    generator = TCRGenerator(model, TransformerDecoderNew(
+        input_dim=64, d_model=128, nhead=8, num_layers=3,
+        vocab_size=dataset.vocab_size, max_len=dataset.max_len
+    )).to(device)
+    opt = optim.Adam(generator.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss(ignore_index=dataset.pad)
+
+    for epoch in range(n_epochs):
+        generator.train()
+        total_loss, total_tokens = 0, 0
+
+        for batch in dataloader:
+            if dataset.use_esm:
+                h, p, t, h_esm, p_esm = batch
+                h_esm = h_esm.to(device) if h_esm[0] is not None else None
+                p_esm = p_esm.to(device) if p_esm[0] is not None else None
+            else:
+                h, p, t = batch
+                h_esm, p_esm = None, None
+
+            h, p, t = h.to(device), p.to(device), t.to(device)
+
+            # 前向传播
+            logits = generator(h.squeeze(1), p.squeeze(1), t, teacher_ratio=0.5, hla_esm=h_esm, pep_esm=p_esm)
+
+            # 计算损失
+            loss = criterion(logits.reshape(-1, dataset.vocab_size), t.reshape(-1))
+            total_loss += loss.item() * t.numel()
+            total_tokens += t.numel()
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        print(f'生成器 Epoch {epoch + 1}/{n_epochs}  loss={total_loss / total_tokens:.4f}')
+
+    return generator
+
+
+def generate_tcr_for_hla_pep(generator, hla_idx, pep_idx, dataset, max_len=20, hla_esm=None, pep_esm=None):
+    device = next(generator.parameters()).device
+    generator.eval()
+    with torch.no_grad():
+        if isinstance(hla_idx, int):
+            hla_idx = torch.LongTensor([hla_idx]).to(device)
+        if isinstance(pep_idx, int):
+            pep_idx = torch.LongTensor([pep_idx]).to(device)
+
+        if hla_esm is not None:
+            hla_esm = hla_esm.to(device)
+        if pep_esm is not None:
+            pep_esm = pep_esm.to(device)
+
+        logits = generator(hla_idx, pep_idx, max_len=max_len, teacher_ratio=0, hla_esm=hla_esm, pep_esm=pep_esm)
+        tokens = logits.argmax(-1)
+        return dataset.decode_tcr(tokens[0])
+
+
+# ----------- 7. 主流程 -----------
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+
+    # 初始化ESM编码器 - 修复：添加错误处理
+    try:
+        esm_encoder = ESMEncoder(device=device)
+        use_esm = True
+    except Exception as e:
+        print(f"ESM编码器初始化失败: {e}，将不使用ESM编码")
+        esm_encoder = None
+        use_esm = False
+
+    # 加载数据 - 修复：使用正确的文件路径
+    print("=== 加载数据 ===")
+    hla_data = load_hla_pep('C:\\Users\\admin\\OneDrive\\桌面\\科研\\data_random1x\\pep_hla_random1x.csv')
+    tcr_data = load_tcr_pep('C:\\Users\\admin\\OneDrive\\桌面\\科研\\data_random1x\\pep_tcr_random1x.csv')
+    tcr_hla_data = load_tcr_hla_pep('C:\\Users\\admin\\OneDrive\\桌面\\科研\\data_random1x\\trimer_random1x.csv')
+
+    print(f"HLA-Peptide 数据: {len(hla_data)} 条")
+    print(f"TCR-Peptide 数据: {len(tcr_data)} 条")
+    print(f"TCR-HLA-Peptide 数据: {len(tcr_hla_data)} 条")
+
+    # 构建全局映射
+    pep2id, id2pep, n_pep = build_global_peptide_mapping(hla_data, tcr_data, tcr_hla_data)
+    tcr2id, id2tcr, n_tcr = build_global_tcr_mapping(tcr_data, tcr_hla_data)
+    hla2id, id2hla, n_hla = build_global_hla_mapping(hla_data, tcr_hla_data)
+
+    print(f"肽数量: {n_pep}, TCR数量: {n_tcr}, HLA数量: {n_hla}")
+
+    # 第一阶段预训练：HLA-peptide关系
+    print("=== 第一阶段：HLA-peptide关系预训练 ===")
+    hla_pep_model, hla_ent2id, hla_id2ent, n_hla_ent = pretrain_kgan_with_relation(
+        hla_data, n_epochs=5, device=device, lambda_rel=0.1,
+        pep2id=pep2id, relation_type="hla_pep", esm_encoder=esm_encoder
+    )
+
+    # 第二阶段预训练：TCR-peptide关系
+    print("=== 第二阶段：TCR-peptide关系预训练 ===")
+    tcr_pep_model, tcr_ent2id, tcr_id2ent, n_tcr_ent = pretrain_kgan_with_relation(
+        tcr_data, n_epochs=5, device=device, lambda_rel=0.1,
+        pep2id=pep2id, relation_type="tcr_pep", esm_encoder=esm_encoder
+    )
+
+    # 第三阶段：三元组分类训练
+    print("=== 第三阶段：三元组分类训练 ===")
+
+    # 分割训练集和测试集
+    random.shuffle(tcr_hla_data)
+    split_idx = int(0.8 * len(tcr_hla_data))
+    train_triples = tcr_hla_data[:split_idx]
+    test_triples = tcr_hla_data[split_idx:]
+
+    print(f"训练集: {len(train_triples)} 条, 测试集: {len(test_triples)} 条")
+
+    # 使用TCR编码器进行三元组分类（因为它已经包含了所有实体）
+    triple_classifier = train_triple_classifier(
+        tcr_pep_model, train_triples, tcr2id, hla2id, pep2id,
+        n_epochs=10, batch_size=32, device=device, esm_encoder=esm_encoder
+    )
+
+    # 评估三元组分类器
+    print("=== 评估三元组分类器 ===")
+    test_metrics = evaluate_triple_classifier(
+        triple_classifier, test_triples, tcr2id, hla2id, pep2id,
+        batch_size=32, device=device, esm_encoder=esm_encoder
+    )
+
+    # 第四阶段：TCR生成（使用融合编码器）
+    print("=== 第四阶段：TCR生成 ===")
+
+    # 创建融合编码器
+    class FusionEncoder(nn.Module):
+        def __init__(self, hla_encoder, tcr_encoder):
+            super().__init__()
+            self.hla_encoder = hla_encoder
+            self.tcr_encoder = tcr_encoder
+            self.combine_layer = hla_encoder.combine_layer
+
+        def encode_hla_peptide_pair(self, hla_idx, pep_idx, hla_esm=None, pep_esm=None):
+            h = self.hla_encoder.forward(hla_idx, hla_esm)
+            p_hla = self.hla_encoder.forward(pep_idx, pep_esm)
+            p_tcr = self.tcr_encoder.forward(pep_idx, pep_esm)
+
+            # 融合策略：平均池化
+            p_fused = (p_hla + p_tcr) / 2
+
+            if h.dim() == 1:
+                h = h.unsqueeze(0)
+            if p_fused.dim() == 1:
+                p_fused = p_fused.unsqueeze(0)
+
+            return self.combine_layer(torch.cat([h, p_fused], dim=-1))
+
+    fusion_encoder = FusionEncoder(hla_pep_model, tcr_pep_model).to(device)
+
+    # 创建TCR生成数据集（只使用正样本）
+    positive_tcr_data = [(tcr, hla, pep, lab) for tcr, hla, pep, lab in tcr_hla_data if lab == 1]
+    print(f"用于TCR生成的正样本数量: {len(positive_tcr_data)}")
+
+    dataset = TCRGenerationDataset(positive_tcr_data, hla2id, pep2id,
+                                   esm_encoder=esm_encoder, max_len=30, use_esm=use_esm)
+
+    if len(dataset) == 0:
+        print("错误：TCR生成数据集为空，无法继续训练")
+        return
+
+    # 训练TCR生成器
+    generator = train_tcr_generator(fusion_encoder, dataset, n_epochs=10,
+                                    batch_size=32, device=device)
+
+    # 生成示例TCR
+    print("\n=== 生成示例 TCR ===")
+    test_samples = [(hla, pep) for _, hla, pep, _ in random.sample(positive_tcr_data, 3)]
+    for hla, pep in test_samples:
+        if hla in hla2id and pep in pep2id:
+            test_hla_idx = hla2id[hla]
+            test_pep_idx = pep2id[pep]
+
+            # 获取ESM嵌入
+            test_hla_esm = esm_encoder.encode_sequences([hla], batch_size=1)[0] if esm_encoder else None
+            test_pep_esm = esm_encoder.encode_sequences([pep], batch_size=1)[0] if esm_encoder else None
+
+            generated_tcr = generate_tcr_for_hla_pep(
+                generator, test_hla_idx, test_pep_idx, dataset,
+                hla_esm=test_hla_esm, pep_esm=test_pep_esm
+            )
+
+            print(f"HLA: {hla}")
+            print(f"Peptide: {pep}")
+            print(f"生成的TCR: {generated_tcr}")
+            print("-" * 50)
+
+    # 保存模型
+    torch.save({
+        'hla_pep_model': hla_pep_model.state_dict(),
+        'tcr_pep_model': tcr_pep_model.state_dict(),
+        'triple_classifier': triple_classifier.state_dict(),
+        'generator': generator.state_dict(),
+        'hla2id': hla2id,
+        'pep2id': pep2id,
+        'tcr2id': tcr2id,
+        'test_metrics': test_metrics
+    }, 'kgan_complete_model_esm.pth')
+
+    print("完整模型已保存到 kgan_complete_model_esm.pth")
+    print("三元组分类器测试结果:")
+    print_metrics(test_metrics)
+
+
+if __name__ == '__main__':
+    main()
